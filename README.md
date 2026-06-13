@@ -75,6 +75,81 @@ The canonical acceptance contract for community SDKs is `examples/storage-stress
 
 Community SDKs publish under their own org (e.g., `pyde-go/`, `pyde-ts-contracts/`) and are listed back into the book by PR against the book repo.
 
+#### What the Rust SDK looks like (reference shape)
+
+To anchor what your SDK is porting, here's the canonical minimal-counter contract in the Rust SDK end-to-end. Your SDK's macros / decorators / proc-gen need to emit the equivalent shape from your language's syntax.
+
+**`otigen.toml`** — the source of truth for state schema and function signatures. SDKs read this at compile time to generate typed accessors + the `pyde.abi` custom section.
+
+```toml
+[contract]
+name    = "counter-rust"
+version = "0.1.0"
+type    = "contract"
+
+[contract.lang]
+language = "rust"
+output   = "target/wasm32-unknown-unknown/release/counter_rust.wasm"
+
+[state]
+schema = [
+    { name = "counter", type = "uint64" },
+]
+
+[functions.increment]
+attributes = ["entry"]
+inputs     = []
+outputs    = ["int64"]
+
+[functions.get]
+attributes = ["entry", "view"]
+inputs     = []
+outputs    = ["int64"]
+```
+
+**`src/lib.rs`** — the contract body. Three macros do the heavy lifting:
+
+```rust
+#![no_std]
+extern crate alloc;
+
+use core::panic::PanicInfo;
+use pyde_host as pyde;
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+// `declare_storage!()` reads `otigen.toml`'s [state].schema at compile
+// time and emits one typed accessor per field. Misspelling a field
+// name or supplying the wrong value type is a compile error.
+pyde::declare_storage!();
+
+// `#[pyde::entry]` wraps each function in the `() -> ()` shim Pyde
+// requires at the WASM boundary: decode calldata → call this inner
+// body → borsh-encode the return value → surface it via `pyde::return`.
+#[pyde::entry]
+fn increment() -> u64 {
+    let next = storage::counter().read().wrapping_add(1);
+    storage::counter().write(next);
+    next
+}
+
+#[pyde::entry]
+fn get() -> u64 {
+    storage::counter().read()
+}
+```
+
+What an SDK port must produce for the equivalent WASM module:
+- **Every exported function** has WASM type `() -> ()`. Args flow in via `pyde::calldata_size` + `pyde::calldata_copy`; return values flow out via `pyde::return`. The chain's deploy validator rejects any other shape.
+- **Storage accessors** read the same `[state].schema` and emit typed read/write/delete operations that route through the chain's typed-storage host fns (`sstore_scalar` / `sload_scalar` / `sstore_map<N>` / `sload_map<N>`), so slot derivation stays on the chain side (`Poseidon2(self_address ‖ field_name ‖ keys…)`).
+- **The `pyde.abi` custom section** is borsh-encoded from `otigen.toml`'s `[contract]` + `[state]` + `[functions]` + `[events]` + `[types]` tables and injected into the WASM module after compilation. The chain reads it at deploy time for function lookup, attribute enforcement, and ABI compatibility checks.
+- **Calldata + return values** are canonical borsh-encoded per the type tokens declared in `otigen.toml`. Same wire format the Rust SDK + the test framework agree on.
+
+The four bullets above are the [`SDK_AUTHOR_GUIDE`](https://book.pyde.network/companion/SDK_AUTHOR_GUIDE.html) invariants in one paragraph — read the spec for the full normative version (every host fn, gas cost, error code, attribute, edge case).
+
 ## Verifying a download manually
 
 If you want to validate a release artifact outside the install script:
