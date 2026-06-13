@@ -25,7 +25,9 @@ exec $SHELL -l                          # reload PATH
 otigen --version
 ```
 
-The install script probes this mirror anonymously, picks the right platform binary, verifies sha256 + sigstore signatures, drops the binary into `~/.otigen/bin/`, and adds it to your `PATH`. No `gh` install, no `GITHUB_TOKEN` setup, no auth dance.
+The install script probes this mirror anonymously, picks the right platform binary, verifies sha256, drops the binary into `~/.otigen/bin/`, and adds it to your `PATH`. No `gh` install, no `GITHUB_TOKEN` setup, no auth dance.
+
+Sigstore signatures (cosign) are uploaded alongside every release for users who want full keyless provenance verification — see [Verifying a download manually](#verifying-a-download-manually) below.
 
 For the full subcommand surface, see [`pyde-net/otigen`](https://github.com/pyde-net/otigen) — that's where the source, docs, and examples live.
 
