@@ -57,6 +57,7 @@ PIN_VERSION=""           # empty = resolve "latest release" at runtime
 PREFIX="${OTIGEN_INSTALL_DIR:-${DEFAULT_PREFIX}}"
 CHECK_ONLY=0
 MODIFY_PATH=1            # set to 0 by --no-modify-path
+VERIFY_SIG=1             # set to 0 by --no-verify-sig (air-gapped / firewall opt-out)
 TARGET=""                # filled in by detect_platform
 TAG=""                   # filled in by resolve_version — full mirror tag (`otigen-vX.Y.Z`)
 VERSION=""               # filled in by resolve_version — stripped (`vX.Y.Z`); embedded in asset names
@@ -88,7 +89,11 @@ Mode flags (mutually exclusive):
                         the upgrade path).
   --update              Alias for the default behavior. Useful in scripts
                         when you want the intent to be explicit.
-  --uninstall           Remove the installed binary.
+  --uninstall           Remove the installed binary + the install.sh-managed
+                        shell-rc PATH block. The wallet keystore at
+                        ~/.pyde/keystore.json is INTENTIONALLY left untouched
+                        — wallet state survives the uninstall by design.
+                        Delete ~/.pyde manually if you want a clean slate.
 
 Options:
   --version <tag>       Pin a specific release tag (e.g. v0.1.0-alpha.0)
@@ -99,6 +104,13 @@ Options:
                         your shell ($SHELL: zsh / bash / fish) and append
                         the export line to the matching rc with marker
                         comments so --uninstall can strip it cleanly.
+  --no-verify-sig       Skip sigstore-keyless signature verification of
+                        the downloaded artifact. Default is to run
+                        `cosign verify-blob` against the release's
+                        `.sig` + `.pem` if cosign is on PATH. Only use
+                        for air-gapped / firewall environments where
+                        sigstore is unreachable; sha256 is still
+                        verified either way.
   --check-only          Dry run. Print what the script would do and exit;
                         no downloads, no writes.
   -h, --help            Show this catalog.
@@ -133,6 +145,7 @@ parse_flags() {
                 PREFIX="$2";         shift 2 ;;
             --prefix=*)     PREFIX="${1#*=}";    shift ;;
             --no-modify-path) MODIFY_PATH=0;     shift ;;
+            --no-verify-sig)  VERIFY_SIG=0;      shift ;;
             -h|--help)      usage; exit 0 ;;
             *)              die "Unknown argument: $1  (run with --help)" ;;
         esac
@@ -317,6 +330,16 @@ mode_uninstall() {
     if (( binary_present )) && [[ -d "$PREFIX" ]] && [[ -z "$(ls -A "$PREFIX")" ]]; then
         rmdir "$PREFIX" 2>/dev/null && log "Removed empty ${PREFIX}"
     fi
+
+    # Surface keystore survival — wallet state lives outside the
+    # install prefix on purpose, so an `otigen wallet new` keypair
+    # outlasts every install.sh --uninstall / re-install. We only
+    # mention it when a keystore is actually present; otherwise the
+    # note is noise.
+    if (( binary_present )) && [[ -f "${HOME}/.pyde/keystore.json" ]]; then
+        log "Note: ~/.pyde/keystore.json was kept (wallet state)."
+        log "      Delete ~/.pyde manually if you want a clean slate."
+    fi
 }
 
 mode_install_or_update() {
@@ -361,7 +384,9 @@ download_and_install() {
     if (( USE_GH )); then
         gh release download "$TAG" --repo "$REPO" \
             --pattern "$asset" \
-            --pattern "${asset}.sha256"
+            --pattern "${asset}.sha256" \
+            --pattern "${asset}.sig" \
+            --pattern "${asset}.pem"
     else
         # Build the meta fetch + per-asset GET commands once; anon vs
         # token-authed branches only differ by the Authorization header.
@@ -376,8 +401,22 @@ download_and_install() {
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${REPO}/releases/tags/${TAG}")
         fi
+        # `.sig` + `.pem` are sigstore-keyless artifacts published
+        # by the release workflow alongside the tarball + sha256.
+        # Pulled here so the verify step below has something to work
+        # with; tolerant if they're absent on a given release
+        # (older tags pre-dating the sigstore step still install).
         local name
-        for name in "$asset" "${asset}.sha256"; do
+        local required
+        for name in "$asset" "${asset}.sha256" "${asset}.sig" "${asset}.pem"; do
+            # tarball + sha256 are required; .sig + .pem are
+            # nice-to-have. A missing required asset aborts; a
+            # missing optional asset just skips with a one-line log.
+            if [[ "$name" == "$asset" || "$name" == "${asset}.sha256" ]]; then
+                required=1
+            else
+                required=0
+            fi
             local url
             # Anonymous downloads use `browser_download_url` (the public
             # CDN-served path); authenticated downloads use `url` with
@@ -396,9 +435,14 @@ for a in data.get('assets', []):
     if a['name'] == '$name':
         print(a['$url_key'])
         break
-else:
-    sys.exit('asset not found: $name')
-")
+" 2>/dev/null || true)
+            if [[ -z "$url" ]]; then
+                if (( required )); then
+                    die "asset not found in release ${TAG}: ${name}"
+                fi
+                log "Note: ${name} not published for ${TAG}; skipping sigstore verify"
+                continue
+            fi
             if (( USE_ANON )); then
                 curl -fsSL -o "$name" "$url"
             else
@@ -417,6 +461,46 @@ else:
         sha256sum -c "${asset}.sha256"
     else
         die "neither shasum nor sha256sum is on PATH — can't verify the artifact"
+    fi
+
+    # Sigstore-keyless verification. The release workflow signs every
+    # artifact with `cosign sign-blob` using an OIDC token from GitHub
+    # Actions; the signature lives in `${asset}.sig`, the leaf
+    # certificate in `${asset}.pem`, and the witness lands in the
+    # public Rekor transparency log. Verifying here pins the binary
+    # to a tag built by the otigen release workflow on the otigen
+    # source repo — supply-chain insurance on top of the sha256.
+    #
+    # `cosign` is a soft dep:
+    #   * `cosign` on PATH + `.sig` + `.pem` present → verify; failure aborts.
+    #   * `cosign` missing → log a hint, skip. sha256 still gates corruption.
+    #   * `.sig` or `.pem` missing → log + skip (older tags pre-date the step).
+    #   * `--no-verify-sig` flag set → opt-out for air-gapped / firewall environments.
+    if (( VERIFY_SIG )); then
+        if [[ -f "${asset}.sig" && -f "${asset}.pem" ]]; then
+            if command -v cosign >/dev/null 2>&1; then
+                log "Verifying sigstore signature"
+                # Certificate identity pins the signer to the otigen
+                # release workflow on the source repo. The
+                # `pyde-net/otigen` repo is private during pre-mainnet,
+                # but sigstore signatures + the Rekor log are public
+                # regardless of source-repo visibility — verification
+                # works anyway.
+                if ! cosign verify-blob \
+                    --signature "${asset}.sig" \
+                    --certificate "${asset}.pem" \
+                    --certificate-identity-regexp "^https://github\\.com/pyde-net/otigen/\\.github/workflows/release\\.yml@" \
+                    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                    "$asset" >/dev/null 2>&1; then
+                    die "sigstore verification failed for ${asset} — bailing rather than install an unverified binary. Pass --no-verify-sig to skip (only for air-gapped / firewall environments)."
+                fi
+                log "Sigstore signature OK"
+            else
+                log "Note: cosign not on PATH; skipping sigstore verify (sha256 still verified). Install cosign from https://github.com/sigstore/cosign for supply-chain verification."
+            fi
+        else
+            log "Note: no .sig / .pem published for ${TAG}; skipping sigstore verify (sha256 still verified)."
+        fi
     fi
 
     log "Extracting"
