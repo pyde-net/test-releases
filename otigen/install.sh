@@ -480,17 +480,36 @@ for a in data.get('assets', []):
         if [[ -f "${asset}.sig" && -f "${asset}.pem" ]]; then
             if command -v cosign >/dev/null 2>&1; then
                 log "Verifying sigstore signature"
-                # Certificate identity pins the signer to the otigen
-                # release workflow on the source repo. The
-                # `pyde-net/otigen` repo is private during pre-mainnet,
-                # but sigstore signatures + the Rekor log are public
-                # regardless of source-repo visibility — verification
-                # works anyway.
+                # Two trusted signing paths produce releases:
+                #
+                #  1. CI release workflow — sigstore mints a cert keyed to
+                #     `https://github.com/pyde-net/otigen/.github/workflows/release.yml@<ref>`
+                #     with issuer `https://token.actions.githubusercontent.com`.
+                #     This is the standard path for tag-pushed releases.
+                #
+                #  2. Maintainer local cut — `tools/release.sh` runs on a
+                #     maintainer's machine; the cert is keyed to a
+                #     maintainer EMAIL (the GitHub-linked address) with
+                #     issuer `https://github.com/login/oauth`. Used when
+                #     we can't run CI for a release (eg. private-repo CI
+                #     quota constraints, emergency tag-cuts).
+                #
+                # Both paths are equally cryptographically verifiable —
+                # the cert is signed by Fulcio either way, logged to
+                # Rekor either way. We pin the SIGNER set explicitly so
+                # neither path widens the accepted-identity surface to
+                # "any GitHub user" — only:
+                #   - the CI workflow
+                #   - the listed maintainer emails
+                #
+                # Add new maintainer addresses here when the keyholder set
+                # changes; removing one is harmless (older releases stay
+                # verifiable because Rekor entries are immutable).
                 if ! cosign verify-blob \
                     --signature "${asset}.sig" \
                     --certificate "${asset}.pem" \
-                    --certificate-identity-regexp "^https://github\\.com/pyde-net/otigen/\\.github/workflows/release\\.yml@" \
-                    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                    --certificate-identity-regexp "^(https://github\\.com/pyde-net/otigen/\\.github/workflows/release\\.yml@|zarah\\.zrh2@gmail\\.com$)" \
+                    --certificate-oidc-issuer-regexp "^(https://token\\.actions\\.githubusercontent\\.com$|https://github\\.com/login/oauth$)" \
                     "$asset" >/dev/null 2>&1; then
                     die "sigstore verification failed for ${asset} — bailing rather than install an unverified binary. Pass --no-verify-sig to skip (only for air-gapped / firewall environments)."
                 fi
